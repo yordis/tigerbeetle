@@ -4,6 +4,22 @@ const assert = std.debug.assert;
 
 const stdx = @import("stdx.zig");
 
+pub const RecordedEvent = extern struct {
+    id: u128,
+    stream_id: u128,
+    type: []const u8,
+    data: []const u8,
+    metadata: ?[]const u8,
+    timestamp: u64,
+    sequence: u64,
+
+    comptime {
+        assert(stdx.no_padding(RecordedEvent));
+        assert(@sizeOf(RecordedEvent) == 64);
+        assert(@alignOf(RecordedEvent) == 16);
+    }
+};
+
 pub const Account = extern struct {
     id: u128,
     debits_pending: u128,
@@ -179,6 +195,11 @@ pub const CreateAccountResult = enum(u32) {
     }
 };
 
+pub const AppendStreamResult = struct {};
+pub const ReadStreamResult = struct {};
+pub const ReadAllResult = struct {};
+
+
 /// Error codes are ordered by descending precedence.
 /// When errors do not have an obvious/natural precedence (e.g. "*_must_not_be_zero"),
 /// the ordering matches struct field order.
@@ -328,6 +349,15 @@ pub const QueryFilterFlags = packed struct(u32) {
         assert(@sizeOf(QueryFilterFlags) == @sizeOf(u32));
         assert(@bitSizeOf(QueryFilterFlags) == @sizeOf(QueryFilterFlags) * 8);
     }
+};
+
+pub const ReadStreamFilter = extern struct {
+    stream_id: u128,
+    limit: u32,
+};
+
+pub const ReadAllFilter = extern struct {
+    limit: u32,
 };
 
 /// Filter used in both `get_account_transfer` and `get_account_balances`.

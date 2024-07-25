@@ -23,6 +23,7 @@ const ScanLookupType = @import("lsm/scan_lookup.zig").ScanLookupType;
 const Direction = @import("direction.zig").Direction;
 const TimestampRange = @import("lsm/timestamp_range.zig").TimestampRange;
 
+const RecordedEvent = tb.RecordedEvent;
 const Account = tb.Account;
 const AccountFlags = tb.AccountFlags;
 const AccountBalance = tb.AccountBalance;
@@ -37,8 +38,15 @@ const CreateTransfersResult = tb.CreateTransfersResult;
 const CreateAccountResult = tb.CreateAccountResult;
 const CreateTransferResult = tb.CreateTransferResult;
 
+const AppendStreamResult = tb.AppendStreamResult;
+const ReadStreamResult = tb.ReadStreamResult;
+const ReadAllResult = tb.ReadAllResult;
+
 const AccountFilter = tb.AccountFilter;
 const QueryFilter = tb.QueryFilter;
+
+const ReadStreamFilter = tb.ReadStreamFilter;
+const ReadAllFilter = tb.ReadAllFilter;
 
 pub fn StateMachineType(
     comptime Storage: type,
@@ -57,6 +65,13 @@ pub fn StateMachineType(
 
             /// The maximum number of objects within a batch, by operation.
             pub const batch_max = struct {
+                pub const append_stream =
+                    operation_batch_max(.append_stream, config.message_body_size_max);
+                pub const read_stream =
+                    operation_batch_max(.read_stream, config.message_body_size_max);
+                pub const read_all =
+                    operation_batch_max(.read_all, config.message_body_size_max);
+
                 pub const create_accounts =
                     operation_batch_max(.create_accounts, config.message_body_size_max);
                 pub const create_transfers =
@@ -83,10 +98,23 @@ pub fn StateMachineType(
                     assert(get_account_balances > 0);
                     assert(query_accounts > 0);
                     assert(query_transfers > 0);
+                    assert(append_stream > 0);
+                    assert(read_stream > 0);
+                    assert(read_all > 0);
                 }
             };
 
             pub const tree_ids = struct {
+                pub const events = .{
+                    .id = 1,
+                    .stream_id = 2,
+                    .type = 3,
+                    .data = 4,
+                    .metadata = 5,
+                    .timestamp = 6,
+                    .sequence = 7,
+                };
+
                 pub const accounts = .{
                     .id = 1,
                     .user_data_128 = 2,
@@ -129,7 +157,10 @@ pub fn StateMachineType(
             .pulse = false,
             .create_accounts = true,
             .create_transfers = true,
+            .append_stream = true,
             // Don't batch lookups/queries for now.
+            .read_stream = false,
+            .read_all = false,
             .lookup_accounts = false,
             .lookup_transfers = false,
             .get_account_transfers = false,
@@ -185,6 +216,17 @@ pub fn StateMachineType(
         }
 
         const batch_value_count_max = batch_value_counts_limit(config.message_body_size_max);
+
+        const EventsGroove = GrooveType(
+            Storage,
+            RecordedEvent,
+            .{
+                .ids = constants.tree_ids.events,
+                .batch_value_count_max = batch_value_count_max.events,
+                .ignored = &[_][]const u8{},
+                .derived = .{},
+            },
+        );
 
         const AccountsGroove = GrooveType(
             Storage,
@@ -294,11 +336,18 @@ pub fn StateMachineType(
         pub const Workload = WorkloadType(StateMachine);
 
         pub const Forest = ForestType(Storage, .{
+            .events = EventsGroove,
             .accounts = AccountsGroove,
             .transfers = TransfersGroove,
             .transfers_pending = TransfersPendingGroove,
             .account_balances = AccountBalancesGroove,
         });
+
+        const EventsScanLookup = ScanLookupType(
+            EventsGroove,
+            EventsGroove.ScanBuilder.Scan,
+            Storage,
+        );
 
         const AccountsScanLookup = ScanLookupType(
             AccountsGroove,
@@ -332,6 +381,10 @@ pub fn StateMachineType(
             get_account_balances = config.vsr_operations_reserved + 6,
             query_accounts = config.vsr_operations_reserved + 7,
             query_transfers = config.vsr_operations_reserved + 8,
+            // ...
+            append_stream = config.vsr_operations_reserved + 9,
+            read_stream = config.vsr_operations_reserved + 10,
+            read_all = config.vsr_operations_reserved + 11,
         };
 
         pub fn operation_from_vsr(operation: vsr.Operation) ?Operation {
@@ -349,6 +402,7 @@ pub fn StateMachineType(
             cache_entries_transfers: u32,
             cache_entries_posted: u32,
             cache_entries_account_balances: u32,
+            cache_entries_events: u32,
         };
 
         /// Since prefetch contexts are used one at a time, it's safe to access
@@ -509,6 +563,9 @@ pub fn StateMachineType(
                 .get_account_balances => AccountFilter,
                 .query_accounts => QueryFilter,
                 .query_transfers => QueryFilter,
+                .append_stream => Event,
+                .read_stream => ReadStreamFilter,
+                .read_all => ReadAllFilter,
             };
         }
 
@@ -523,6 +580,9 @@ pub fn StateMachineType(
                 .get_account_balances => AccountBalance,
                 .query_accounts => Account,
                 .query_transfers => Transfer,
+                .append_stream => AppendStreamResult,
+                .read_stream => ReadStreamResult,
+                .read_all => ReadAllResult,
             };
         }
 
@@ -1348,6 +1408,10 @@ pub fn StateMachineType(
                 .get_account_balances => self.execute_get_account_balances(input, output),
                 .query_accounts => self.execute_query_accounts(input, output),
                 .query_transfers => self.execute_query_transfers(input, output),
+
+                .append_stream => self.execute_append_stream(timestamp, input, output),
+                .read_stream => self.execute_read_stream(input, output),
+                .read_all => self.execute_read_all(output),
             };
 
             tracer.end(
@@ -1664,6 +1728,43 @@ pub fn StateMachineType(
             );
             return result_size;
         }
+
+        fn execute_append_stream(
+            self: *StateMachine,
+            timestamp: u64,
+            input: []align(16) const u8,
+            output: *align(16) [constants.message_body_size_max]u8,
+        ) usize {
+            _ = output;
+            const event = mem.bytesAsValue(RecordedEvent, input);
+            event.timestamp = timestamp;
+            self.forest.grooves.events.insert(event);
+            self.commit_timestamp = timestamp;
+            return 0;
+        }
+
+        fn execute_read_stream(
+            self: *StateMachine,
+            input: []const u8,
+            output: *align(16) [constants.message_body_size_max]u8,
+        ) usize {
+            const stream_id = mem.readIntLittle(u128, input[0..16]);
+            const events = self.forest.grooves.events.getMany(stream_id);
+            const result_size = events.len * @sizeOf(Event);
+            @memcpy(output[0..result_size], mem.sliceAsBytes(events));
+            return result_size;
+        }
+
+        fn execute_read_all(
+            self: *StateMachine,
+            output: *align(16) [constants.message_body_size_max]u8,
+        ) usize {
+            const events = self.forest.grooves.events.getAll();
+            const result_size = events.len * @sizeOf(Event);
+            @memcpy(output[0..result_size], mem.sliceAsBytes(events));
+            return result_size;
+        }
+
 
         fn execute_query_transfers(
             self: *StateMachine,
